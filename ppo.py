@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -32,6 +32,8 @@ class PPOTrainer:
         lr: float = 3e-4,
         gamma: float = 0.99,
         clip_eps: float = 0.2,
+        use_clipping: bool = True,
+        kl_coef: float = 0.0,
         entropy_coef: float = 0.01,
         value_coef: float = 0.5,
         ppo_epochs: int = 4,
@@ -44,6 +46,9 @@ class PPOTrainer:
         self.reward_model = reward_model
         self.gamma = gamma
         self.clip_eps = clip_eps
+        self.use_clipping = use_clipping
+        self.kl_coef = kl_coef
+        self.ref_policy: Optional[ActorCritic] = None
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.ppo_epochs = ppo_epochs
@@ -54,6 +59,12 @@ class PPOTrainer:
 
     def set_clip_eps(self, clip_eps: float) -> None:
         self.clip_eps = clip_eps
+
+    def set_kl_coef(self, kl_coef: float) -> None:
+        self.kl_coef = kl_coef
+
+    def set_ref_policy(self, ref_policy: Optional[ActorCritic]) -> None:
+        self.ref_policy = ref_policy
 
     def collect_rollout(self) -> Tuple[PPOBatch, List[Trajectory]]:
         """Collect on-policy rollout; rewards come from the frozen reward model."""
@@ -133,6 +144,13 @@ class PPOTrainer:
             out[t] = g
         return out
 
+    def _ref_policy_kl(self, logp: torch.Tensor, mb_obs: torch.Tensor, mb_actions: torch.Tensor) -> torch.Tensor:
+        if self.ref_policy is None:
+            return torch.zeros(1, device=logp.device)
+        with torch.no_grad():
+            ref_logp, _, _ = self.ref_policy.evaluate_actions(mb_obs, mb_actions)
+        return (torch.exp(ref_logp - logp) - (ref_logp - logp) - 1).mean()
+
     def update(self, batch: PPOBatch) -> Dict[str, float]:
         obs = torch.as_tensor(batch.obs, device=self.device)
         actions = torch.as_tensor(batch.actions, device=self.device)
@@ -142,6 +160,7 @@ class PPOTrainer:
 
         n = len(obs)
         approx_kls: List[float] = []
+        ref_kls: List[float] = []
         policy_losses: List[float] = []
         value_losses: List[float] = []
 
@@ -157,9 +176,14 @@ class PPOTrainer:
 
                 logp, values, entropy = self.policy.evaluate_actions(mb_obs, mb_actions)
                 ratio = torch.exp(logp - mb_logp_old)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+
+                if self.use_clipping:
+                    surr1 = ratio * mb_adv
+                    surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * mb_adv
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                else:
+                    policy_loss = -(ratio * mb_adv).mean()
+
                 value_loss = F.mse_loss(values, mb_returns)
                 loss = (
                     policy_loss
@@ -167,21 +191,31 @@ class PPOTrainer:
                     - self.entropy_coef * entropy.mean()
                 )
 
+                if not self.use_clipping and self.kl_coef > 0:
+                    ref_kl = self._ref_policy_kl(logp, mb_obs, mb_actions)
+                    loss = loss + self.kl_coef * ref_kl
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
 
                 with torch.no_grad():
-                    # Schulman approx KL: E[(r - 1) - log r], r = pi_new / pi_old
                     ratio = torch.exp(logp - mb_logp_old)
                     approx_kl = (ratio - 1 - torch.log(ratio)).mean().item()
+                    ref_kl_val = self._ref_policy_kl(logp, mb_obs, mb_actions).item()
                 approx_kls.append(approx_kl)
+                ref_kls.append(ref_kl_val)
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
 
-        return {
+        metrics = {
             "approx_policy_kl": float(np.mean(approx_kls)),
+            "ref_policy_kl": float(np.mean(ref_kls)),
             "policy_loss": float(np.mean(policy_losses)),
             "value_loss": float(np.mean(value_losses)),
-            "clip_epsilon": self.clip_eps,
         }
+        if self.use_clipping:
+            metrics["clip_epsilon"] = self.clip_eps
+        else:
+            metrics["kl_coef"] = self.kl_coef
+        return metrics

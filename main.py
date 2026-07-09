@@ -189,6 +189,27 @@ def clip_eps_from_drift_and_critic(
     return final_eps, base_eps
 
 
+def update_kl_coef(
+    beta: float,
+    measured_kl: float,
+    target_kl: float,
+    adapt_coef: float,
+    beta_min: float,
+    beta_max: float,
+    mode: str = "step",
+) -> float:
+    """Target-KL adaptive β: increase when KL above target, decrease when below."""
+    if mode == "smooth":
+        if target_kl > 1e-8:
+            beta *= 1.0 + 0.5 * (measured_kl / target_kl - 1.0)
+    else:
+        if measured_kl > target_kl:
+            beta *= adapt_coef
+        else:
+            beta /= adapt_coef
+    return float(np.clip(beta, beta_min, beta_max))
+
+
 def critic_error_ref_for_grid(grid_size: int, base: float = 10.0, ref_grid: int = 5) -> float:
     return base * (grid_size / ref_grid)
 
@@ -207,6 +228,71 @@ def hidden_dim_for_grid(grid_size: int) -> int:
 
 RM_VARIANTS = ["full_rm", "broken_rm"]
 RM_VARIANT_DIRS = {"full_rm": "full_rm", "broken_rm": "broken_rm"}
+
+CONSTRAINT_SUITES = ["clip", "kl"]
+SUITE_DIRS = {"clip": "clip", "kl": "kl"}
+
+CLIP_METHODS = ["fixed_rm", "vanilla_updated_rm", "fixed_rm_critic_clip", "adaptive_clip"]
+CLIP_METHOD_LABELS = {
+    "fixed_rm": "Fixed RM, fixed ε",
+    "vanilla_updated_rm": "Updated RM, fixed ε",
+    "fixed_rm_critic_clip": "Fixed RM, critic ε",
+    "adaptive_clip": "Updated RM, critic ε",
+}
+
+KL_METHODS = [
+    "fixed_rm_static_kl",
+    "updated_rm_static_kl",
+    "fixed_rm_adaptive_kl",
+    "updated_rm_adaptive_kl",
+]
+KL_METHOD_LABELS = {
+    "fixed_rm_static_kl": "Fixed RM, static β",
+    "updated_rm_static_kl": "Updated RM, static β",
+    "fixed_rm_adaptive_kl": "Fixed RM, adaptive β",
+    "updated_rm_adaptive_kl": "Updated RM, adaptive β",
+}
+
+UPDATED_RM_METHODS = {
+    "vanilla_updated_rm",
+    "adaptive_clip",
+    "updated_rm_static_kl",
+    "updated_rm_adaptive_kl",
+}
+ADAPTIVE_KL_METHODS = {"fixed_rm_adaptive_kl", "updated_rm_adaptive_kl"}
+CRITIC_CLIP_METHODS = {"fixed_rm_critic_clip", "adaptive_clip"}
+
+
+def methods_for_suite(constraint_suite: str) -> List[str]:
+    if constraint_suite == "clip":
+        return CLIP_METHODS
+    if constraint_suite == "kl":
+        return KL_METHODS
+    raise ValueError(f"Unknown constraint_suite: {constraint_suite}")
+
+
+def method_labels_for_suite(constraint_suite: str) -> Dict[str, str]:
+    if constraint_suite == "clip":
+        return CLIP_METHOD_LABELS
+    if constraint_suite == "kl":
+        return KL_METHOD_LABELS
+    raise ValueError(f"Unknown constraint_suite: {constraint_suite}")
+
+
+def method_updates_rm(method: str) -> bool:
+    return method in UPDATED_RM_METHODS
+
+
+def method_uses_critic_clip(method: str) -> bool:
+    return method in CRITIC_CLIP_METHODS
+
+
+def method_uses_adaptive_kl(method: str) -> bool:
+    return method in ADAPTIVE_KL_METHODS
+
+
+def method_uses_drift_for_clip(method: str) -> bool:
+    return method == "adaptive_clip"
 
 
 @dataclass
@@ -394,6 +480,7 @@ def collect_policy_trajectories(
 @dataclass
 class RunConfig:
     method: str
+    constraint_suite: str = "clip"
     num_outer_iters: int = 25
     rm_update_interval: int = 5
     seed: int = 0
@@ -405,6 +492,12 @@ class RunConfig:
     eps_max: float = 0.25
     eps_min: float = 0.05
     rm_variant: str = "full_rm"
+    kl_beta_static: float = 0.1
+    kl_target: float = 0.02
+    kl_adapt_coef: float = 1.5
+    kl_beta_min: float = 0.01
+    kl_beta_max: float = 1.0
+    kl_adapt_mode: str = "step"
 
     @property
     def rm_spec(self) -> RewardModelSpec:
@@ -476,14 +569,18 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
     train_reward_model(reward_model, pref_ds, epochs=40, seed=cfg.seed)
 
     clip_eps = 0.2
+    kl_coef = cfg.kl_beta_static
     last_drift = 0.0
     pref_acc = preference_accuracy(reward_model, heldout_pairs_ds.pairs)
 
+    use_clipping = cfg.constraint_suite == "clip"
     ppo = PPOTrainer(
         env=env,
         policy=policy,
         reward_model=reward_model,
         clip_eps=clip_eps,
+        use_clipping=use_clipping,
+        kl_coef=kl_coef,
         rollout_steps=cfg.rollout_steps,
         ppo_epochs=3,
     )
@@ -497,7 +594,7 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         recent_trajs = collect_policy_trajectories(env, policy, n=24)
 
         rm_updated = False
-        if cfg.method in ("vanilla_updated_rm", "adaptive_clip"):
+        if method_updates_rm(cfg.method):
             if outer_iter % cfg.rm_update_interval == 0 and outer_iter > 0:
                 pref_ds.add_pairs_from_trajectories(
                     recent_trajs,
@@ -512,27 +609,51 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
                 pref_acc = preference_accuracy(reward_model, heldout_pairs_ds.pairs)
                 rm_updated = True
 
+        ref_policy_kl_values: List[float] = []
+        if not use_clipping:
+            ref_policy = copy.deepcopy(policy)
+            ppo.set_ref_policy(ref_policy)
+            if method_uses_adaptive_kl(cfg.method):
+                ppo.set_kl_coef(kl_coef)
+            else:
+                kl_coef = cfg.kl_beta_static
+                ppo.set_kl_coef(kl_coef)
+
         # PPO training on learned rewards (not true env reward).
         kl_values = []
         critic_error = float("nan")
-        clip_eps_base = clip_eps
+        clip_eps_base = float("nan")
         for ppo_i in range(cfg.ppo_updates_per_outer):
             batch, _ = ppo.collect_rollout()
-            use_critic_clip = cfg.method in ("fixed_rm_critic_clip", "adaptive_clip")
-            if use_critic_clip and ppo_i == 0:
-                critic_error = float(np.mean(np.abs(batch.returns - batch.values)))
-                drift = last_drift if cfg.method == "adaptive_clip" else 0.0
-                clip_eps, clip_eps_base = clip_eps_from_drift_and_critic(
-                    drift,
-                    critic_error,
-                    eps_max=cfg.eps_max,
-                    eps_min=cfg.eps_min,
-                    critic_error_ref=cfg.critic_error_ref,
-                    grid_size=cfg.grid_size,
-                )
-                ppo.set_clip_eps(clip_eps)
+            if use_clipping:
+                clip_eps_base = clip_eps
+                if method_uses_critic_clip(cfg.method) and ppo_i == 0:
+                    critic_error = float(np.mean(np.abs(batch.returns - batch.values)))
+                    drift = last_drift if method_uses_drift_for_clip(cfg.method) else 0.0
+                    clip_eps, clip_eps_base = clip_eps_from_drift_and_critic(
+                        drift,
+                        critic_error,
+                        eps_max=cfg.eps_max,
+                        eps_min=cfg.eps_min,
+                        critic_error_ref=cfg.critic_error_ref,
+                        grid_size=cfg.grid_size,
+                    )
+                    ppo.set_clip_eps(clip_eps)
             metrics = ppo.update(batch)
             kl_values.append(metrics["approx_policy_kl"])
+            if not use_clipping:
+                ref_policy_kl_values.append(metrics.get("ref_policy_kl", float("nan")))
+                if method_uses_adaptive_kl(cfg.method):
+                    kl_coef = update_kl_coef(
+                        kl_coef,
+                        metrics["approx_policy_kl"],
+                        cfg.kl_target,
+                        cfg.kl_adapt_coef,
+                        cfg.kl_beta_min,
+                        cfg.kl_beta_max,
+                        mode=cfg.kl_adapt_mode,
+                    )
+                    ppo.set_kl_coef(kl_coef)
 
         true_ret = policy_rollout_true_return(env, policy, cfg.eval_episodes)
         learned_ret = policy_rollout_learned_return(policy, reward_model, env, cfg.eval_episodes)
@@ -545,32 +666,45 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         true_history.append(true_ret)
         true_autc, true_autc_norm = area_under_true_reward_curve(true_history)
 
-        logs.append(
-            {
-                "method": cfg.method,
-                "seed": cfg.seed,
-                "grid_size": cfg.grid_size,
-                "rm_variant": cfg.rm_variant,
-                "rm_input_mode": cfg.rm_input_mode,
-                "rm_hidden": cfg.rm_hidden,
-                "rm_layers": cfg.rm_layers,
-                "outer_iter": outer_iter,
-                "true_eval_return": true_ret,
-                "learned_eval_return": learned_ret,
-                "true_ndh": true_ndh,
-                "true_ndh_norm": true_ndh_norm,
-                "true_autc": true_autc,
-                "true_autc_norm": true_autc_norm,
-                "reward_model_drift": last_drift,
-                "reward_model_pref_accuracy": pref_acc,
-                "clip_epsilon": clip_eps,
-                "clip_eps_base": clip_eps_base,
-                "critic_error": critic_error,
-                "approx_policy_kl": float(np.mean(kl_values)),
-                "preference_dataset_size": len(pref_ds),
-                "rm_updated": int(rm_updated),
-            }
-        )
+        log_row: Dict = {
+            "constraint_suite": cfg.constraint_suite,
+            "method": cfg.method,
+            "seed": cfg.seed,
+            "grid_size": cfg.grid_size,
+            "rm_variant": cfg.rm_variant,
+            "rm_input_mode": cfg.rm_input_mode,
+            "rm_hidden": cfg.rm_hidden,
+            "rm_layers": cfg.rm_layers,
+            "outer_iter": outer_iter,
+            "true_eval_return": true_ret,
+            "learned_eval_return": learned_ret,
+            "true_ndh": true_ndh,
+            "true_ndh_norm": true_ndh_norm,
+            "true_autc": true_autc,
+            "true_autc_norm": true_autc_norm,
+            "reward_model_drift": last_drift,
+            "reward_model_pref_accuracy": pref_acc,
+            "approx_policy_kl": float(np.mean(kl_values)),
+            "preference_dataset_size": len(pref_ds),
+            "rm_updated": int(rm_updated),
+        }
+        if use_clipping:
+            log_row["clip_epsilon"] = clip_eps
+            log_row["clip_eps_base"] = clip_eps_base
+            log_row["critic_error"] = critic_error
+            log_row["kl_coef"] = float("nan")
+            log_row["kl_target"] = float("nan")
+            log_row["ref_policy_kl"] = float("nan")
+        else:
+            log_row["clip_epsilon"] = float("nan")
+            log_row["clip_eps_base"] = float("nan")
+            log_row["critic_error"] = float("nan")
+            log_row["kl_coef"] = kl_coef
+            log_row["kl_target"] = cfg.kl_target
+            log_row["ref_policy_kl"] = (
+                float(np.mean(ref_policy_kl_values)) if ref_policy_kl_values else float("nan")
+            )
+        logs.append(log_row)
 
     return logs
 
@@ -580,13 +714,8 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 
-METHODS = ["fixed_rm", "vanilla_updated_rm", "fixed_rm_critic_clip", "adaptive_clip"]
-METHOD_LABELS = {
-    "fixed_rm": "Fixed RM, fixed ε",
-    "vanilla_updated_rm": "Updated RM, fixed ε",
-    "fixed_rm_critic_clip": "Fixed RM, critic ε",
-    "adaptive_clip": "Updated RM, critic ε",
-}
+METHODS = CLIP_METHODS
+METHOD_LABELS = CLIP_METHOD_LABELS
 
 
 def save_logs_csv(all_logs: List[Dict], path: str) -> None:
@@ -601,16 +730,20 @@ def save_logs_csv(all_logs: List[Dict], path: str) -> None:
 
 
 def aggregate_by_method(
-    all_logs: List[Dict], metric: str
+    all_logs: List[Dict],
+    metric: str,
+    methods: Optional[List[str]] = None,
+    method_labels: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Return per-method (xs, mean, std) over seeds."""
+    if methods is None:
+        methods = sorted(set(r["method"] for r in all_logs))
     out: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    for method in METHODS:
+    for method in methods:
         method_logs = [r for r in all_logs if r["method"] == method]
         seeds = sorted(set(r["seed"] for r in method_logs))
         if not seeds:
             continue
-        # Align by outer_iter
         iters = sorted(set(r["outer_iter"] for r in method_logs))
         xs = np.array(iters)
         curves = []
@@ -628,11 +761,16 @@ def plot_metric(
     ylabel: str,
     title: str,
     out_path: str,
+    methods: Optional[List[str]] = None,
+    method_labels: Optional[Dict[str, str]] = None,
 ) -> None:
-    agg = aggregate_by_method(all_logs, metric)
+    labels = method_labels or METHOD_LABELS
+    agg = aggregate_by_method(all_logs, metric, methods=methods)
     plt.figure(figsize=(7, 4.5))
     for method, (xs, mean, std) in agg.items():
-        plt.plot(xs, mean, label=METHOD_LABELS[method], linewidth=2)
+        if np.all(np.isnan(mean)):
+            continue
+        plt.plot(xs, mean, label=labels.get(method, method), linewidth=2)
         plt.fill_between(xs, mean - std, mean + std, alpha=0.2)
     plt.xlabel("Outer iteration")
     plt.ylabel(ylabel)
@@ -644,14 +782,20 @@ def plot_metric(
     plt.close()
 
 
-def print_summary(all_logs: List[Dict], rm_variant: Optional[str] = None) -> None:
+def print_summary(
+    all_logs: List[Dict],
+    constraint_suite: str,
+    rm_variant: Optional[str] = None,
+) -> None:
+    methods = methods_for_suite(constraint_suite)
+    labels = method_labels_for_suite(constraint_suite)
     print("\n" + "=" * 60)
-    title = "EXPERIMENT SUMMARY: Reward Model Drift & PPO Stability"
+    title = f"EXPERIMENT SUMMARY ({constraint_suite}): Reward Model Drift & PPO Stability"
     if rm_variant is not None:
         title += f" ({rm_variant})"
     print(title)
     print("=" * 60)
-    for method in METHODS:
+    for method in methods:
         rows = [r for r in all_logs if r["method"] == method]
         if not rows:
             continue
@@ -671,7 +815,7 @@ def print_summary(all_logs: List[Dict], rm_variant: Optional[str] = None) -> Non
                 autc_norm_by_seed[r["seed"]] = float(r["true_autc_norm"])
         ndh_norms = list(ndh_norm_by_seed.values())
         autc_norms = list(autc_norm_by_seed.values())
-        print(f"\n{METHOD_LABELS[method]}:")
+        print(f"\n{labels[method]}:")
         print(f"  Final true return: {np.mean(finals):.3f} ± {np.std(finals):.3f}")
         print(f"  Mean policy KL:    {np.mean(kls):.4f} ± {np.std(kls):.4f}")
         print(f"  Final true NDH (norm): {np.mean(ndh_norms):.3f} ± {np.std(ndh_norms):.3f}")
@@ -679,43 +823,19 @@ def print_summary(all_logs: List[Dict], rm_variant: Optional[str] = None) -> Non
     print("\nInterpretation:")
     print("  - Higher final true return = better alignment with real goal/trap rewards.")
     print("  - Large policy KL spikes after RM updates suggest PPO instability.")
-    print("  - Critic-informed methods recompute ε every outer iter from critic mismatch.")
-    print("  - adaptive_clip also uses last RM drift for base ε (updated when RM retrains).")
+    if constraint_suite == "clip":
+        print("  - Critic-informed methods recompute ε every outer iter from critic mismatch.")
+        print("  - adaptive_clip also uses last RM drift for base ε (updated when RM retrains).")
+    else:
+        print("  - KL suite: J(π)=E[R̂]−β·KL(π∥π_ref); adaptive β from measured KL vs target.")
+        print("  - Static β methods hold β fixed; adaptive methods update β each PPO update.")
     print("  - True NDH (norm): J_R0(π) − max J_R0 vs peak gain (Skalse et al. 2023); ≤ 0.")
     print("  - True AUTC (norm): ∫ J_R0 along training path; higher = sustained true reward.")
     print("=" * 60 + "\n")
 
 
-def run_variant_experiments(
-    rm_variant: str,
-    seeds: List[int],
-    args: argparse.Namespace,
-) -> List[Dict]:
-    variant_dir = os.path.join(args.results_dir, RM_VARIANT_DIRS[rm_variant])
-    os.makedirs(variant_dir, exist_ok=True)
-
-    all_logs: List[Dict] = []
-    for method in METHODS:
-        for seed in seeds:
-            print(f"Running [{rm_variant}] {method} seed={seed} ...")
-            cfg = RunConfig(
-                method=method,
-                num_outer_iters=args.num_outer_iters,
-                rm_update_interval=args.rm_update_interval,
-                seed=seed,
-                ppo_updates_per_outer=args.ppo_updates_per_outer,
-                grid_size=args.grid_size,
-                rm_variant=rm_variant,
-            )
-            logs = run_experiment(cfg)
-            all_logs.extend(logs)
-
-    csv_path = os.path.join(variant_dir, "experiment_logs.csv")
-    add_true_autc_to_logs(all_logs)
-    save_logs_csv(all_logs, csv_path)
-    print(f"Saved logs to {csv_path}")
-
-    plots = [
+def plots_for_suite(constraint_suite: str) -> List[Tuple[str, str, str]]:
+    shared = [
         ("true_eval_return", "True eval return", "True environment return vs training"),
         ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
         ("true_ndh_norm", "True NDH (normalised)", "Normalised drop height on true reward R₀"),
@@ -725,16 +845,65 @@ def run_variant_experiments(
             "Area under the true-reward curve (overoptimization)",
         ),
         ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
-        ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training (drift ÷ 6×N)"),
-        ("critic_error", "Critic error", "Mean |returns − values| when ε is set"),
         ("approx_policy_kl", "Approx policy KL", "Approximate policy KL vs training"),
     ]
-    for metric, ylabel, title in plots:
+    if constraint_suite == "clip":
+        return shared + [
+            ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training (drift ÷ 6×N)"),
+            ("critic_error", "Critic error", "Mean |returns − values| when ε is set"),
+        ]
+    return shared + [
+        ("kl_coef", "KL coefficient β", "KL penalty coefficient vs training"),
+        ("ref_policy_kl", "Ref-policy KL", "KL(π ∥ π_ref) vs training"),
+    ]
+
+
+def run_variant_experiments(
+    rm_variant: str,
+    seeds: List[int],
+    args: argparse.Namespace,
+    constraint_suite: str,
+) -> List[Dict]:
+    suite_dir = os.path.join(args.results_dir, SUITE_DIRS[constraint_suite])
+    variant_dir = os.path.join(suite_dir, RM_VARIANT_DIRS[rm_variant])
+    os.makedirs(variant_dir, exist_ok=True)
+
+    methods = methods_for_suite(constraint_suite)
+    labels = method_labels_for_suite(constraint_suite)
+    all_logs: List[Dict] = []
+    for method in methods:
+        for seed in seeds:
+            print(f"Running [{constraint_suite}/{rm_variant}] {method} seed={seed} ...")
+            cfg = RunConfig(
+                method=method,
+                constraint_suite=constraint_suite,
+                num_outer_iters=args.num_outer_iters,
+                rm_update_interval=args.rm_update_interval,
+                seed=seed,
+                ppo_updates_per_outer=args.ppo_updates_per_outer,
+                grid_size=args.grid_size,
+                rm_variant=rm_variant,
+                kl_beta_static=args.kl_beta_static,
+                kl_target=args.kl_target,
+                kl_adapt_coef=args.kl_adapt_coef,
+                kl_beta_min=args.kl_beta_min,
+                kl_beta_max=args.kl_beta_max,
+                kl_adapt_mode=args.kl_adapt_mode,
+            )
+            logs = run_experiment(cfg)
+            all_logs.extend(logs)
+
+    csv_path = os.path.join(variant_dir, "experiment_logs.csv")
+    add_true_autc_to_logs(all_logs)
+    save_logs_csv(all_logs, csv_path)
+    print(f"Saved logs to {csv_path}")
+
+    for metric, ylabel, title in plots_for_suite(constraint_suite):
         out = os.path.join(variant_dir, f"{metric}.png")
-        plot_metric(all_logs, metric, ylabel, title, out)
+        plot_metric(all_logs, metric, ylabel, title, out, methods=methods, method_labels=labels)
         print(f"Saved plot {out}")
 
-    print_summary(all_logs, rm_variant=rm_variant)
+    print_summary(all_logs, constraint_suite=constraint_suite, rm_variant=rm_variant)
     return all_logs
 
 
@@ -756,6 +925,25 @@ def main() -> None:
         choices=["both", "full_rm", "broken_rm"],
         help="Run with full RM, broken RM (coords linear), or both",
     )
+    parser.add_argument(
+        "--constraint_suite",
+        type=str,
+        default="both",
+        choices=["both", "clip", "kl"],
+        help="PPO constraint suite: clip epsilon, KL penalty, or both",
+    )
+    parser.add_argument("--kl_beta_static", type=float, default=0.1)
+    parser.add_argument("--kl_target", type=float, default=0.02)
+    parser.add_argument("--kl_adapt_coef", type=float, default=1.5)
+    parser.add_argument("--kl_beta_min", type=float, default=0.01)
+    parser.add_argument("--kl_beta_max", type=float, default=1.0)
+    parser.add_argument(
+        "--kl_adapt_mode",
+        type=str,
+        default="step",
+        choices=["step", "smooth"],
+        help="Adaptive β update rule",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
@@ -773,6 +961,11 @@ def main() -> None:
             f"  RM [{variant}]: input={spec.input_mode}, hidden={spec.hidden}, "
             f"layers={spec.layers}, params={n_params}"
         )
+    if args.constraint_suite in ("both", "kl"):
+        print(
+            f"  KL penalty: β_static={args.kl_beta_static}, target={args.kl_target}, "
+            f"adapt_coef={args.kl_adapt_coef}, mode={args.kl_adapt_mode}"
+        )
     print()
 
     if args.rm_mode == "both":
@@ -780,8 +973,14 @@ def main() -> None:
     else:
         variants = [args.rm_mode]
 
-    for rm_variant in variants:
-        run_variant_experiments(rm_variant, seeds, args)
+    if args.constraint_suite == "both":
+        suites = CONSTRAINT_SUITES
+    else:
+        suites = [args.constraint_suite]
+
+    for constraint_suite in suites:
+        for rm_variant in variants:
+            run_variant_experiments(rm_variant, seeds, args, constraint_suite=constraint_suite)
 
 
 if __name__ == "__main__":
