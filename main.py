@@ -205,6 +205,23 @@ def hidden_dim_for_grid(grid_size: int) -> int:
     return 128
 
 
+RM_VARIANTS = ["full_rm", "broken_rm"]
+RM_VARIANT_DIRS = {"full_rm": "full_rm", "broken_rm": "broken_rm"}
+
+
+def reward_model_spec_for_variant(variant: str, grid_size: int) -> Tuple[int, int]:
+    if variant == "full_rm":
+        return hidden_dim_for_grid(grid_size), 2
+    if variant == "broken_rm":
+        return 8, 1
+    raise ValueError(f"Unknown rm_variant: {variant}")
+
+
+def reward_model_param_count(obs_dim: int, hidden: int, layers: int) -> int:
+    model = RewardModel(obs_dim, hidden=hidden, layers=layers)
+    return sum(p.numel() for p in model.parameters())
+
+
 def normalised_drop_height(
     true_return: float,
     peak_true: float,
@@ -328,6 +345,17 @@ class RunConfig:
     grid_size: int = 10
     eps_max: float = 0.25
     eps_min: float = 0.05
+    rm_variant: str = "full_rm"
+
+    @property
+    def rm_hidden(self) -> int:
+        hidden, _ = reward_model_spec_for_variant(self.rm_variant, self.grid_size)
+        return hidden
+
+    @property
+    def rm_layers(self) -> int:
+        _, layers = reward_model_spec_for_variant(self.rm_variant, self.grid_size)
+        return layers
 
     @property
     def critic_error_ref(self) -> float:
@@ -356,7 +384,9 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
     hidden = cfg.hidden_dim
 
     policy = ActorCritic(obs_dim, num_actions=4, hidden=hidden)
-    reward_model = RewardModel(obs_dim, hidden=hidden)
+    reward_model = RewardModel(
+        obs_dim, hidden=cfg.rm_hidden, layers=cfg.rm_layers
+    )
     old_rm: Optional[RewardModel] = None
 
     # Fixed validation trajectories for drift measurement (random behavior).
@@ -447,6 +477,9 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
                 "method": cfg.method,
                 "seed": cfg.seed,
                 "grid_size": cfg.grid_size,
+                "rm_variant": cfg.rm_variant,
+                "rm_hidden": cfg.rm_hidden,
+                "rm_layers": cfg.rm_layers,
                 "outer_iter": outer_iter,
                 "true_eval_return": true_ret,
                 "learned_eval_return": learned_ret,
@@ -535,9 +568,12 @@ def plot_metric(
     plt.close()
 
 
-def print_summary(all_logs: List[Dict]) -> None:
+def print_summary(all_logs: List[Dict], rm_variant: Optional[str] = None) -> None:
     print("\n" + "=" * 60)
-    print("EXPERIMENT SUMMARY: Reward Model Drift & PPO Stability")
+    title = "EXPERIMENT SUMMARY: Reward Model Drift & PPO Stability"
+    if rm_variant is not None:
+        title += f" ({rm_variant})"
+    print(title)
     print("=" * 60)
     for method in METHODS:
         rows = [r for r in all_logs if r["method"] == method]
@@ -569,6 +605,52 @@ def print_summary(all_logs: List[Dict]) -> None:
     print("=" * 60 + "\n")
 
 
+def run_variant_experiments(
+    rm_variant: str,
+    seeds: List[int],
+    args: argparse.Namespace,
+) -> List[Dict]:
+    variant_dir = os.path.join(args.results_dir, RM_VARIANT_DIRS[rm_variant])
+    os.makedirs(variant_dir, exist_ok=True)
+
+    all_logs: List[Dict] = []
+    for method in METHODS:
+        for seed in seeds:
+            print(f"Running [{rm_variant}] {method} seed={seed} ...")
+            cfg = RunConfig(
+                method=method,
+                num_outer_iters=args.num_outer_iters,
+                rm_update_interval=args.rm_update_interval,
+                seed=seed,
+                ppo_updates_per_outer=args.ppo_updates_per_outer,
+                grid_size=args.grid_size,
+                rm_variant=rm_variant,
+            )
+            logs = run_experiment(cfg)
+            all_logs.extend(logs)
+
+    csv_path = os.path.join(variant_dir, "experiment_logs.csv")
+    save_logs_csv(all_logs, csv_path)
+    print(f"Saved logs to {csv_path}")
+
+    plots = [
+        ("true_eval_return", "True eval return", "True environment return vs training"),
+        ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
+        ("true_ndh_norm", "True NDH (normalised)", "Normalised drop height on true reward R₀"),
+        ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
+        ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training (drift ÷ 6×N)"),
+        ("critic_error", "Critic error", "Mean |returns − values| when ε is set"),
+        ("approx_policy_kl", "Approx policy KL", "Approximate policy KL vs training"),
+    ]
+    for metric, ylabel, title in plots:
+        out = os.path.join(variant_dir, f"{metric}.png")
+        plot_metric(all_logs, metric, ylabel, title, out)
+        print(f"Saved plot {out}")
+
+    print_summary(all_logs, rm_variant=rm_variant)
+    return all_logs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="RLHF-style PPO experiment studying reward model drift."
@@ -580,48 +662,36 @@ def main() -> None:
     parser.add_argument("--results_dir", type=str, default="results")
     parser.add_argument("--ppo_updates_per_outer", type=int, default=2)
     parser.add_argument("--grid_size", type=int, default=10, help="NxN gridworld size")
+    parser.add_argument(
+        "--rm_mode",
+        type=str,
+        default="both",
+        choices=["both", "full_rm", "broken_rm"],
+        help="Run with full RM, broken RM (linear 8-dim), or both",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
     seeds = [args.seed + i for i in range(args.num_seeds)]
+    obs_dim = args.grid_size * args.grid_size
 
     print(f"Grid size: {args.grid_size}x{args.grid_size}")
     print(f"  max_steps={6 * args.grid_size}, rollout_steps={rollout_steps_for_grid(args.grid_size)}")
-    print(f"  critic_error_ref={critic_error_ref_for_grid(args.grid_size):.2f}, hidden={hidden_dim_for_grid(args.grid_size)}\n")
+    print(f"  critic_error_ref={critic_error_ref_for_grid(args.grid_size):.2f}")
+    print(f"  policy hidden={hidden_dim_for_grid(args.grid_size)}")
+    for variant in RM_VARIANTS:
+        h, layers = reward_model_spec_for_variant(variant, args.grid_size)
+        n_params = reward_model_param_count(obs_dim, h, layers)
+        print(f"  RM [{variant}]: hidden={h}, layers={layers}, params={n_params}")
+    print()
 
-    all_logs: List[Dict] = []
-    for method in METHODS:
-        for seed in seeds:
-            print(f"Running {method} seed={seed} ...")
-            cfg = RunConfig(
-                method=method,
-                num_outer_iters=args.num_outer_iters,
-                rm_update_interval=args.rm_update_interval,
-                seed=seed,
-                ppo_updates_per_outer=args.ppo_updates_per_outer,
-                grid_size=args.grid_size,
-            )
-            logs = run_experiment(cfg)
-            all_logs.extend(logs)
+    if args.rm_mode == "both":
+        variants = RM_VARIANTS
+    else:
+        variants = [args.rm_mode]
 
-    csv_path = os.path.join(args.results_dir, "experiment_logs.csv")
-    save_logs_csv(all_logs, csv_path)
-    print(f"Saved logs to {csv_path}")
-
-    plots = [
-        ("true_eval_return", "True eval return", "True environment return vs training"),
-        ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
-        ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
-        ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training (drift ÷ 6×N)"),
-        ("critic_error", "Critic error", "Mean |returns − values| when ε is set"),
-        ("approx_policy_kl", "Approx policy KL", "Approximate policy KL vs training"),
-    ]
-    for metric, ylabel, title in plots:
-        out = os.path.join(args.results_dir, f"{metric}.png")
-        plot_metric(all_logs, metric, ylabel, title, out)
-        print(f"Saved plot {out}")
-
-    print_summary(all_logs)
+    for rm_variant in variants:
+        run_variant_experiments(rm_variant, seeds, args)
 
 
 if __name__ == "__main__":

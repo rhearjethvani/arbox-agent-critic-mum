@@ -59,9 +59,9 @@ class ActorCritic(nn.Module):
 class RewardModel(nn.Module):
     """Predicts scalar reward per state (state-action extension is trivial)."""
 
-    def __init__(self, obs_dim: int, hidden: int = 64):
+    def __init__(self, obs_dim: int, hidden: int = 64, layers: int = 2):
         super().__init__()
-        self.net = mlp(obs_dim, hidden, 1, layers=2)
+        self.net = mlp(obs_dim, hidden, 1, layers=layers)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.net(obs).squeeze(-1)

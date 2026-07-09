@@ -31,6 +31,26 @@ loss = -log σ(RM_return_preferred - RM_return_rejected)
 
 **Drift** is measured on a fixed validation set of trajectories as the mean absolute change in predicted returns before vs after an RM update.
 
+### Full vs broken RM (dual-run)
+
+By default each invocation runs the **same** 4-method experiment **twice** with different RM capacity (policy/actor-critic unchanged):
+
+| Variant | Architecture | Role |
+|---------|--------------|------|
+| **full_rm** | 2-layer MLP, `hidden = hidden_dim_for_grid(N)` | Current baseline (~9.8k params on 10×10) |
+| **broken_rm** | **1-layer linear**, `hidden = 8` | Weak proxy (~808 params on 10×10) |
+
+The broken RM has far fewer parameters and should fit preferences poorly, exaggerating proxy misalignment and method differences.
+
+Use `--rm_mode full_rm`, `--rm_mode broken_rm`, or `--rm_mode both` (default).
+
+Results are written to separate subdirs:
+
+- `results/full_rm/` — CSV + plots
+- `results/broken_rm/` — CSV + plots
+
+CSV rows include `rm_variant`, `rm_hidden`, and `rm_layers`.
+
 ## Four methods
 
 | Method | Reward model | PPO clip ε |
@@ -109,20 +129,19 @@ Hyperparameters scale lightly with grid size: `rollout_steps` and network hidden
 
 ## Metrics & plots
 
-Saved under `results/`:
+Saved under `results/full_rm/` and `results/broken_rm/` (when `--rm_mode both`):
 
 | Plot | Meaning |
 |------|---------|
 | `true_eval_return.png` | Policy quality under the **true** reward (main success metric) |
 | `learned_eval_return.png` | Return under the **current** reward model (what PPO optimizes) |
-| `true_ndh_norm.png` | **Goodharting / over-optimization**: NDH on true reward R₀ ([Skalse et al. 2023](https://arxiv.org/abs/2310.09144)) |
+| `true_ndh_norm.png` | Goodharting on true reward R₀ ([Skalse et al. 2023](https://arxiv.org/abs/2310.09144)) |
 | `reward_model_drift.png` | How much RM outputs shift on validation trajectories after updates |
 | `clip_epsilon.png` | Final PPO clip ε vs training (drift normalized by 6×N before thresholding) |
-| `clip_eps_base.png` | Drift-only ε before critic tightening (adaptive_clip) |
 | `critic_error.png` | Critic mismatch each time ε is recomputed (critic-informed methods) |
 | `approx_policy_kl.png` | Proxy for policy change magnitude—spikes may indicate instability |
 
-Raw logs: `results/experiment_logs.csv` (includes `grid_size`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
+Raw logs: `results/{full_rm,broken_rm}/experiment_logs.csv` (includes `rm_variant`, `rm_hidden`, `rm_layers`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
 
 ### True-reward over-optimization metric (NDH)
 
@@ -153,9 +172,16 @@ python main.py \
   --grid_size 10 \
   --num_outer_iters 25 \
   --rm_update_interval 5 \
+  --rm_mode both \
   --seed 0 \
   --num_seeds 3 \
   --results_dir results
+```
+
+Quick smoke test (both RM variants):
+
+```bash
+python main.py --rm_mode both --num_seeds 1 --num_outer_iters 3 --grid_size 5
 ```
 
 Compare with the original small env:
@@ -164,7 +190,7 @@ Compare with the original small env:
 python main.py --grid_size 5
 ```
 
-Runtime scales with grid size (~7–10 min on CPU for 10×10, 4 methods × 3 seeds).
+Runtime scales with grid size (~14–20 min on CPU for 10×10, 4 methods × 3 seeds × 2 RM variants).
 
 ## Expected takeaways
 
@@ -173,6 +199,7 @@ Runtime scales with grid size (~7–10 min on CPU for 10×10, 4 methods × 3 see
 - **Fixed RM + critic ε** isolates whether critic-informed clipping helps even without RM drift.
 - **Adaptive clip** should dampen policy updates when both RM drift and critic mismatch are high, potentially improving stability without fully freezing the RM.
 
-If methods still look too similar on 10×10, try `--grid_size 15`, lower `--initial_pref_pairs`, or shorter `--rm_update_interval`.
+- **Broken RM** (`broken_rm`) should show lower preference accuracy and worse true returns, making method contrasts sharper.
+- **Full RM** (`full_rm`) is the capacity-matched baseline.
 
 Results are stochastic; run multiple seeds (`--num_seeds 3`) and compare aggregated curves (mean ± std shaded).
