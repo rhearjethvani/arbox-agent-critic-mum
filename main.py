@@ -2,7 +2,8 @@
 RLHF-style PPO experiment: reward model drift and adaptive clipping.
 
 Compares fixed reward model PPO, vanilla periodically-updated RM PPO, and
-adaptive-clip PPO when the learned reward signal shifts during training.
+critic-informed drift-adaptive PPO when the learned reward signal shifts
+during training.
 """
 
 from __future__ import annotations
@@ -133,12 +134,53 @@ def preference_accuracy(
     return correct / len(pairs)
 
 
-def clip_eps_from_drift(drift: float) -> float:
-    if drift < 0.05:
-        return 0.25
-    if drift < 0.15:
-        return 0.15
-    return 0.05
+def clip_eps_from_drift(
+    drift: float,
+    eps_max: float = 0.25,
+    eps_min: float = 0.05,
+    drift_low: float = 0.05,
+    drift_mid: float = 0.15,
+) -> float:
+    eps_mid = (eps_max + eps_min) / 2.0
+    if drift < drift_low:
+        return eps_max
+    if drift < drift_mid:
+        return eps_mid
+    return eps_min
+
+
+def clip_eps_from_drift_and_critic(
+    drift: float,
+    critic_error: float,
+    eps_max: float = 0.25,
+    eps_min: float = 0.05,
+    drift_low: float = 0.05,
+    drift_mid: float = 0.15,
+    critic_error_ref: float = 10.0,
+) -> Tuple[float, float]:
+    """Drift sets base ε; critic mismatch tightens toward eps_min."""
+    base_eps = clip_eps_from_drift(
+        drift, eps_max=eps_max, eps_min=eps_min, drift_low=drift_low, drift_mid=drift_mid
+    )
+    stress = min(critic_error / critic_error_ref, 1.0)
+    final_eps = base_eps - stress * (base_eps - eps_min)
+    return final_eps, base_eps
+
+
+def critic_error_ref_for_grid(grid_size: int, base: float = 10.0, ref_grid: int = 5) -> float:
+    return base * (grid_size / ref_grid)
+
+
+def rollout_steps_for_grid(grid_size: int, base: int = 192, ref_grid: int = 5) -> int:
+    return int(base * (grid_size / ref_grid))
+
+
+def hidden_dim_for_grid(grid_size: int) -> int:
+    if grid_size <= 5:
+        return 64
+    if grid_size <= 10:
+        return 96
+    return 128
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +282,21 @@ class RunConfig:
     initial_pref_pairs: int = 128
     pairs_per_update: int = 48
     eval_episodes: int = 15
+    grid_size: int = 10
+    eps_max: float = 0.25
+    eps_min: float = 0.05
+
+    @property
+    def critic_error_ref(self) -> float:
+        return critic_error_ref_for_grid(self.grid_size)
+
+    @property
+    def rollout_steps(self) -> int:
+        return rollout_steps_for_grid(self.grid_size)
+
+    @property
+    def hidden_dim(self) -> int:
+        return hidden_dim_for_grid(self.grid_size)
 
 
 def run_experiment(cfg: RunConfig) -> List[Dict]:
@@ -251,11 +308,12 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
 
-    env = GridWorld(obs_type="onehot", seed=cfg.seed)
+    env = GridWorld(grid_size=cfg.grid_size, obs_type="onehot", seed=cfg.seed)
     obs_dim = env.obs_dim
+    hidden = cfg.hidden_dim
 
-    policy = ActorCritic(obs_dim, num_actions=4)
-    reward_model = RewardModel(obs_dim)
+    policy = ActorCritic(obs_dim, num_actions=4, hidden=hidden)
+    reward_model = RewardModel(obs_dim, hidden=hidden)
     old_rm: Optional[RewardModel] = None
 
     # Fixed validation trajectories for drift measurement (random behavior).
@@ -284,7 +342,7 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         policy=policy,
         reward_model=reward_model,
         clip_eps=clip_eps,
-        rollout_steps=192,
+        rollout_steps=cfg.rollout_steps,
         ppo_epochs=3,
     )
 
@@ -308,14 +366,23 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
                 last_drift = compute_drift(old_rm, reward_model, validation_trajs)
                 pref_acc = preference_accuracy(reward_model, heldout_pairs_ds.pairs)
                 rm_updated = True
-                if cfg.method == "adaptive_clip":
-                    clip_eps = clip_eps_from_drift(last_drift)
-                    ppo.set_clip_eps(clip_eps)
 
         # PPO training on learned rewards (not true env reward).
         kl_values = []
-        for _ in range(cfg.ppo_updates_per_outer):
+        critic_error = float("nan")
+        clip_eps_base = clip_eps
+        for ppo_i in range(cfg.ppo_updates_per_outer):
             batch, _ = ppo.collect_rollout()
+            if rm_updated and cfg.method == "adaptive_clip" and ppo_i == 0:
+                critic_error = float(np.mean(np.abs(batch.returns - batch.values)))
+                clip_eps, clip_eps_base = clip_eps_from_drift_and_critic(
+                    last_drift,
+                    critic_error,
+                    eps_max=cfg.eps_max,
+                    eps_min=cfg.eps_min,
+                    critic_error_ref=cfg.critic_error_ref,
+                )
+                ppo.set_clip_eps(clip_eps)
             metrics = ppo.update(batch)
             kl_values.append(metrics["approx_policy_kl"])
 
@@ -326,12 +393,15 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
             {
                 "method": cfg.method,
                 "seed": cfg.seed,
+                "grid_size": cfg.grid_size,
                 "outer_iter": outer_iter,
                 "true_eval_return": true_ret,
                 "learned_eval_return": learned_ret,
                 "reward_model_drift": last_drift,
                 "reward_model_pref_accuracy": pref_acc,
                 "clip_epsilon": clip_eps,
+                "clip_eps_base": clip_eps_base,
+                "critic_error": critic_error,
                 "approx_policy_kl": float(np.mean(kl_values)),
                 "preference_dataset_size": len(pref_ds),
                 "rm_updated": int(rm_updated),
@@ -350,7 +420,7 @@ METHODS = ["fixed_rm", "vanilla_updated_rm", "adaptive_clip"]
 METHOD_LABELS = {
     "fixed_rm": "Fixed RM",
     "vanilla_updated_rm": "Vanilla updated RM",
-    "adaptive_clip": "Adaptive clip",
+    "adaptive_clip": "Critic-informed adaptive clip",
 }
 
 
@@ -383,7 +453,7 @@ def aggregate_by_method(
             seed_rows = {r["outer_iter"]: r[metric] for r in method_logs if r["seed"] == seed}
             curves.append([seed_rows[i] for i in iters])
         arr = np.array(curves, dtype=np.float64)
-        out[method] = (xs, arr.mean(axis=0), arr.std(axis=0))
+        out[method] = (xs, np.nanmean(arr, axis=0), np.nanstd(arr, axis=0))
     return out
 
 
@@ -431,7 +501,7 @@ def print_summary(all_logs: List[Dict]) -> None:
     print("\nInterpretation:")
     print("  - Higher final true return = better alignment with real goal/trap rewards.")
     print("  - Large policy KL spikes after RM updates suggest PPO instability.")
-    print("  - Adaptive clip should reduce KL spikes when drift is high.")
+    print("  - Adaptive clip tightens ε from RM drift, then further when critic mismatch is high.")
     print("=" * 60 + "\n")
 
 
@@ -445,10 +515,15 @@ def main() -> None:
     parser.add_argument("--num_seeds", type=int, default=3)
     parser.add_argument("--results_dir", type=str, default="results")
     parser.add_argument("--ppo_updates_per_outer", type=int, default=2)
+    parser.add_argument("--grid_size", type=int, default=10, help="NxN gridworld size")
     args = parser.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
     seeds = [args.seed + i for i in range(args.num_seeds)]
+
+    print(f"Grid size: {args.grid_size}x{args.grid_size}")
+    print(f"  max_steps={6 * args.grid_size}, rollout_steps={rollout_steps_for_grid(args.grid_size)}")
+    print(f"  critic_error_ref={critic_error_ref_for_grid(args.grid_size):.2f}, hidden={hidden_dim_for_grid(args.grid_size)}\n")
 
     all_logs: List[Dict] = []
     for method in METHODS:
@@ -460,6 +535,7 @@ def main() -> None:
                 rm_update_interval=args.rm_update_interval,
                 seed=seed,
                 ppo_updates_per_outer=args.ppo_updates_per_outer,
+                grid_size=args.grid_size,
             )
             logs = run_experiment(cfg)
             all_logs.extend(logs)
@@ -473,6 +549,8 @@ def main() -> None:
         ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
         ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
         ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training"),
+        ("clip_eps_base", "Drift-only clip ε", "Drift-based clip epsilon before critic tightening"),
+        ("critic_error", "Critic error", "Mean |returns − values| after RM updates"),
         ("approx_policy_kl", "Approx policy KL", "Approximate policy KL vs training"),
     ]
     for metric, ylabel, title in plots:
