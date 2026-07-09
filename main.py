@@ -396,10 +396,15 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         clip_eps_base = clip_eps
         for ppo_i in range(cfg.ppo_updates_per_outer):
             batch, _ = ppo.collect_rollout()
-            if rm_updated and cfg.method == "adaptive_clip" and ppo_i == 0:
+            use_critic_clip = cfg.method in ("fixed_rm_critic_clip", "adaptive_clip")
+            adjust_clip = use_critic_clip and ppo_i == 0 and (
+                cfg.method == "fixed_rm_critic_clip" or rm_updated
+            )
+            if adjust_clip:
                 critic_error = float(np.mean(np.abs(batch.returns - batch.values)))
+                drift = last_drift if cfg.method == "adaptive_clip" else 0.0
                 clip_eps, clip_eps_base = clip_eps_from_drift_and_critic(
-                    last_drift,
+                    drift,
                     critic_error,
                     eps_max=cfg.eps_max,
                     eps_min=cfg.eps_min,
@@ -446,11 +451,12 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 
-METHODS = ["fixed_rm", "vanilla_updated_rm", "adaptive_clip"]
+METHODS = ["fixed_rm", "vanilla_updated_rm", "fixed_rm_critic_clip", "adaptive_clip"]
 METHOD_LABELS = {
-    "fixed_rm": "Fixed RM",
-    "vanilla_updated_rm": "Vanilla updated RM",
-    "adaptive_clip": "Critic-informed adaptive clip",
+    "fixed_rm": "Fixed RM, fixed ε",
+    "vanilla_updated_rm": "Updated RM, fixed ε",
+    "fixed_rm_critic_clip": "Fixed RM, critic ε",
+    "adaptive_clip": "Updated RM, critic ε",
 }
 
 
@@ -537,7 +543,8 @@ def print_summary(all_logs: List[Dict]) -> None:
     print("\nInterpretation:")
     print("  - Higher final true return = better alignment with real goal/trap rewards.")
     print("  - Large policy KL spikes after RM updates suggest PPO instability.")
-    print("  - Adaptive clip tightens ε from RM drift, then further when critic mismatch is high.")
+    print("  - Critic-informed methods tighten ε when |returns − values| is high.")
+    print("  - adaptive_clip also sets base ε from RM drift after each RM update.")
     print("  - True NDH (norm): J_R0(π) − max J_R0 vs peak gain (Skalse et al. 2023); ≤ 0.")
     print("=" * 60 + "\n")
 
@@ -584,10 +591,8 @@ def main() -> None:
     plots = [
         ("true_eval_return", "True eval return", "True environment return vs training"),
         ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
-        ("true_ndh_norm", "True NDH (normalised)", "Normalised drop height on true reward R₀"),
         ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
         ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training"),
-        ("clip_eps_base", "Drift-only clip ε", "Drift-based clip epsilon before critic tightening"),
         ("critic_error", "Critic error", "Mean |returns − values| after RM updates"),
         ("approx_policy_kl", "Approx policy KL", "Approximate policy KL vs training"),
     ]

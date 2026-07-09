@@ -31,21 +31,22 @@ loss = -log σ(RM_return_preferred - RM_return_rejected)
 
 **Drift** is measured on a fixed validation set of trajectories as the mean absolute change in predicted returns before vs after an RM update.
 
-## Three methods
+## Four methods
 
 | Method | Reward model | PPO clip ε |
 |--------|--------------|------------|
 | **fixed_rm** | Trained once, then frozen | Fixed 0.2 |
 | **vanilla_updated_rm** | Retrained every K outer iterations | Fixed 0.2 |
-| **adaptive_clip** | Same as vanilla | Drift-based base ε (0.25 / 0.15 / 0.05), tightened by critic mismatch after RM updates |
+| **fixed_rm_critic_clip** | Same as fixed_rm | Critic-informed ε every outer iteration (drift = 0) |
+| **adaptive_clip** | Same as vanilla | Drift-based base ε after RM updates, tightened by critic mismatch |
 
 ### Critic-informed adaptive clipping
 
-On each RM update iteration, `adaptive_clip`:
+`fixed_rm_critic_clip` and `adaptive_clip` both tighten ε from critic mismatch on the first PPO rollout each outer iteration (`fixed_rm_critic_clip`) or after each RM update (`adaptive_clip`):
 
-1. Computes **drift** → discrete base ε via `clip_eps_from_drift`
-2. Collects an on-policy rollout under the **new** RM
-3. Measures **critic error** = mean(|returns − values|) — how misaligned the value head is with the new reward signal
+1. (`adaptive_clip` only) Computes **drift** → discrete base ε via `clip_eps_from_drift`
+2. Collects an on-policy rollout
+3. Measures **critic error** = mean(|returns − values|) — how misaligned the value head is with the reward signal
 4. Tightens ε toward `eps_min` proportional to critic stress:
 
 ```
@@ -61,7 +62,7 @@ For each outer iteration:
 
 1. Collect trajectories with the current policy
 2. If the method updates the RM and `outer_iter % rm_update_interval == 0`: add preference pairs, retrain RM, compute drift
-3. Run PPO updates using **learned** RM rewards (adaptive_clip sets ε from drift + critic on the first PPO step after an RM update)
+3. Run PPO updates using **learned** RM rewards (`fixed_rm_critic_clip` / `adaptive_clip` set ε from critic on the first PPO step each outer iter or after RM updates)
 4. Evaluate with true environment reward
 5. Log metrics
 
@@ -79,7 +80,7 @@ Saved under `results/`:
 | `reward_model_drift.png` | How much RM outputs shift on validation trajectories after updates |
 | `clip_epsilon.png` | Final PPO clip ε vs training |
 | `clip_eps_base.png` | Drift-only ε before critic tightening (adaptive_clip) |
-| `critic_error.png` | Critic mismatch after RM updates (adaptive_clip) |
+| `critic_error.png` | Critic mismatch when ε is adjusted (critic-informed methods) |
 | `approx_policy_kl.png` | Proxy for policy change magnitude—spikes may indicate instability |
 
 Raw logs: `results/experiment_logs.csv` (includes `grid_size`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
@@ -124,12 +125,13 @@ Compare with the original small env:
 python main.py --grid_size 5
 ```
 
-Runtime scales with grid size (~5–8 min on CPU for 10×10, 3 methods × 3 seeds).
+Runtime scales with grid size (~7–10 min on CPU for 10×10, 4 methods × 3 seeds).
 
 ## Expected takeaways
 
 - **Vanilla updated RM** may show KL spikes and noisier true returns after RM updates.
 - **Fixed RM** is stable but may plateau if the initial RM is weak.
+- **Fixed RM + critic ε** isolates whether critic-informed clipping helps even without RM drift.
 - **Adaptive clip** should dampen policy updates when both RM drift and critic mismatch are high, potentially improving stability without fully freezing the RM.
 
 If methods still look too similar on 10×10, try `--grid_size 15`, lower `--initial_pref_pairs`, or shorter `--rm_update_interval`.
