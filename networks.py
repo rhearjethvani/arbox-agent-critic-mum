@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,6 +20,15 @@ def mlp(in_dim: int, hidden: int, out_dim: int, layers: int = 2) -> nn.Sequentia
         d = hidden
     mods.append(nn.Linear(d, out_dim))
     return nn.Sequential(*mods)
+
+
+def onehot_to_coords_batch(obs: torch.Tensor, grid_size: int) -> torch.Tensor:
+    """Decode batch of one-hot observations to normalized (row, col) coords."""
+    idx = obs.argmax(dim=-1)
+    r = idx // grid_size
+    c = idx % grid_size
+    denom = max(grid_size - 1, 1)
+    return torch.stack([r.float() / denom, c.float() / denom], dim=-1)
 
 
 class ActorCritic(nn.Module):
@@ -59,12 +68,33 @@ class ActorCritic(nn.Module):
 class RewardModel(nn.Module):
     """Predicts scalar reward per state (state-action extension is trivial)."""
 
-    def __init__(self, obs_dim: int, hidden: int = 64, layers: int = 2):
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden: int = 64,
+        layers: int = 2,
+        input_mode: str = "onehot",
+        grid_size: Optional[int] = None,
+    ):
         super().__init__()
-        self.net = mlp(obs_dim, hidden, 1, layers=layers)
+        if input_mode not in ("onehot", "coords"):
+            raise ValueError("input_mode must be 'onehot' or 'coords'")
+        if input_mode == "coords" and grid_size is None:
+            raise ValueError("grid_size required when input_mode='coords'")
+        self.input_mode = input_mode
+        self.grid_size = grid_size
+        rm_in_dim = 2 if input_mode == "coords" else obs_dim
+        self.net = mlp(rm_in_dim, hidden, 1, layers=layers)
+
+    def _encode_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if self.input_mode == "coords":
+            return onehot_to_coords_batch(obs, self.grid_size)
+        return obs
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs).squeeze(-1)
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+        return self.net(self._encode_obs(obs)).squeeze(-1)
 
     def trajectory_return(self, traj: Trajectory) -> float:
         if len(traj.states) == 0:

@@ -34,6 +34,14 @@ def trap_pos(grid_size: int) -> Tuple[int, int]:
     return (grid_size - 1, 0)
 
 
+def onehot_to_coords(obs: np.ndarray, grid_size: int) -> np.ndarray:
+    """Decode one-hot grid cell to normalized (row, col) coords."""
+    idx = int(np.argmax(obs))
+    r, c = divmod(idx, grid_size)
+    denom = max(grid_size - 1, 1)
+    return np.array([r / denom, c / denom], dtype=np.float32)
+
+
 @dataclass
 class StepResult:
     obs: np.ndarray

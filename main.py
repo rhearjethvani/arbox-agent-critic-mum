@@ -209,16 +209,35 @@ RM_VARIANTS = ["full_rm", "broken_rm"]
 RM_VARIANT_DIRS = {"full_rm": "full_rm", "broken_rm": "broken_rm"}
 
 
-def reward_model_spec_for_variant(variant: str, grid_size: int) -> Tuple[int, int]:
+@dataclass
+class RewardModelSpec:
+    hidden: int
+    layers: int
+    input_mode: str
+
+
+def reward_model_spec_for_variant(variant: str, grid_size: int) -> RewardModelSpec:
     if variant == "full_rm":
-        return hidden_dim_for_grid(grid_size), 2
+        return RewardModelSpec(
+            hidden=hidden_dim_for_grid(grid_size), layers=2, input_mode="onehot"
+        )
     if variant == "broken_rm":
-        return 8, 1
+        return RewardModelSpec(hidden=2, layers=1, input_mode="coords")
     raise ValueError(f"Unknown rm_variant: {variant}")
 
 
-def reward_model_param_count(obs_dim: int, hidden: int, layers: int) -> int:
-    model = RewardModel(obs_dim, hidden=hidden, layers=layers)
+def reward_model_param_count(
+    obs_dim: int,
+    spec: RewardModelSpec,
+    grid_size: Optional[int] = None,
+) -> int:
+    model = RewardModel(
+        obs_dim,
+        hidden=spec.hidden,
+        layers=spec.layers,
+        input_mode=spec.input_mode,
+        grid_size=grid_size if spec.input_mode == "coords" else None,
+    )
     return sum(p.numel() for p in model.parameters())
 
 
@@ -348,14 +367,20 @@ class RunConfig:
     rm_variant: str = "full_rm"
 
     @property
+    def rm_spec(self) -> RewardModelSpec:
+        return reward_model_spec_for_variant(self.rm_variant, self.grid_size)
+
+    @property
     def rm_hidden(self) -> int:
-        hidden, _ = reward_model_spec_for_variant(self.rm_variant, self.grid_size)
-        return hidden
+        return self.rm_spec.hidden
 
     @property
     def rm_layers(self) -> int:
-        _, layers = reward_model_spec_for_variant(self.rm_variant, self.grid_size)
-        return layers
+        return self.rm_spec.layers
+
+    @property
+    def rm_input_mode(self) -> str:
+        return self.rm_spec.input_mode
 
     @property
     def critic_error_ref(self) -> float:
@@ -385,7 +410,11 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
 
     policy = ActorCritic(obs_dim, num_actions=4, hidden=hidden)
     reward_model = RewardModel(
-        obs_dim, hidden=cfg.rm_hidden, layers=cfg.rm_layers
+        obs_dim,
+        hidden=cfg.rm_hidden,
+        layers=cfg.rm_layers,
+        input_mode=cfg.rm_input_mode,
+        grid_size=cfg.grid_size if cfg.rm_input_mode == "coords" else None,
     )
     old_rm: Optional[RewardModel] = None
 
@@ -478,6 +507,7 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
                 "seed": cfg.seed,
                 "grid_size": cfg.grid_size,
                 "rm_variant": cfg.rm_variant,
+                "rm_input_mode": cfg.rm_input_mode,
                 "rm_hidden": cfg.rm_hidden,
                 "rm_layers": cfg.rm_layers,
                 "outer_iter": outer_iter,
@@ -667,7 +697,7 @@ def main() -> None:
         type=str,
         default="both",
         choices=["both", "full_rm", "broken_rm"],
-        help="Run with full RM, broken RM (linear 8-dim), or both",
+        help="Run with full RM, broken RM (coords linear), or both",
     )
     args = parser.parse_args()
 
@@ -680,9 +710,12 @@ def main() -> None:
     print(f"  critic_error_ref={critic_error_ref_for_grid(args.grid_size):.2f}")
     print(f"  policy hidden={hidden_dim_for_grid(args.grid_size)}")
     for variant in RM_VARIANTS:
-        h, layers = reward_model_spec_for_variant(variant, args.grid_size)
-        n_params = reward_model_param_count(obs_dim, h, layers)
-        print(f"  RM [{variant}]: hidden={h}, layers={layers}, params={n_params}")
+        spec = reward_model_spec_for_variant(variant, args.grid_size)
+        n_params = reward_model_param_count(obs_dim, spec, grid_size=args.grid_size)
+        print(
+            f"  RM [{variant}]: input={spec.input_mode}, hidden={spec.hidden}, "
+            f"layers={spec.layers}, params={n_params}"
+        )
     print()
 
     if args.rm_mode == "both":

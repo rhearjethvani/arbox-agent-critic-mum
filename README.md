@@ -37,10 +37,10 @@ By default each invocation runs the **same** 4-method experiment **twice** with 
 
 | Variant | Architecture | Role |
 |---------|--------------|------|
-| **full_rm** | 2-layer MLP, `hidden = hidden_dim_for_grid(N)` | Current baseline (~9.8k params on 10×10) |
-| **broken_rm** | **1-layer linear**, `hidden = 8` | Weak proxy (~808 params on 10×10) |
+| **full_rm** | 2-layer MLP on **one-hot** obs, `hidden = hidden_dim_for_grid(N)` | Baseline (~9.8k params on 10×10) |
+| **broken_rm** | **Linear(2→1)** on normalized **(row, col)** only | Weak proxy (~3 params); policy still uses one-hot |
 
-The broken RM has far fewer parameters and should fit preferences poorly, exaggerating proxy misalignment and method differences.
+A one-hot linear RM (`N²→1`) is a per-cell lookup table and can still learn goal/trap well. The broken RM only sees position coordinates, so it cannot memorize individual cells — only a coarse position-linear proxy.
 
 Use `--rm_mode full_rm`, `--rm_mode broken_rm`, or `--rm_mode both` (default).
 
@@ -49,7 +49,7 @@ Results are written to separate subdirs:
 - `results/full_rm/` — CSV + plots
 - `results/broken_rm/` — CSV + plots
 
-CSV rows include `rm_variant`, `rm_hidden`, and `rm_layers`.
+CSV rows include `rm_variant`, `rm_input_mode`, `rm_hidden`, and `rm_layers`.
 
 ## Four methods
 
@@ -141,7 +141,7 @@ Saved under `results/full_rm/` and `results/broken_rm/` (when `--rm_mode both`):
 | `critic_error.png` | Critic mismatch each time ε is recomputed (critic-informed methods) |
 | `approx_policy_kl.png` | Proxy for policy change magnitude—spikes may indicate instability |
 
-Raw logs: `results/{full_rm,broken_rm}/experiment_logs.csv` (includes `rm_variant`, `rm_hidden`, `rm_layers`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
+Raw logs: `results/{full_rm,broken_rm}/experiment_logs.csv` (includes `rm_variant`, `rm_input_mode`, `rm_hidden`, `rm_layers`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
 
 ### True-reward over-optimization metric (NDH)
 
