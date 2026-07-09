@@ -75,13 +75,29 @@ Saved under `results/`:
 |------|---------|
 | `true_eval_return.png` | Policy quality under the **true** reward (main success metric) |
 | `learned_eval_return.png` | Return under the **current** reward model (what PPO optimizes) |
+| `true_ndh_norm.png` | **Goodharting / over-optimization**: NDH on true reward R₀ ([Skalse et al. 2023](https://arxiv.org/abs/2310.09144)) |
 | `reward_model_drift.png` | How much RM outputs shift on validation trajectories after updates |
 | `clip_epsilon.png` | Final PPO clip ε vs training |
 | `clip_eps_base.png` | Drift-only ε before critic tightening (adaptive_clip) |
 | `critic_error.png` | Critic mismatch after RM updates (adaptive_clip) |
 | `approx_policy_kl.png` | Proxy for policy change magnitude—spikes may indicate instability |
 
-Raw logs: `results/experiment_logs.csv` (includes `grid_size`, `critic_error`, `clip_eps_base`)
+Raw logs: `results/experiment_logs.csv` (includes `grid_size`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
+
+### True-reward over-optimization metric (NDH)
+
+Skalse et al. (2023) Definition 5: optimise a proxy R₁ but measure **true** reward R₀:
+
+```
+NDH = J_R0(π_now) − max_{λ} J_R0(π_λ)
+```
+
+In this experiment R₀ is the **true gridworld reward** (`true_eval_return`); PPO trains on the learned RM (proxy). Each outer iteration:
+
+- `true_ndh` = current true return − running peak true return (≤ 0; more negative = larger Goodhart drop)
+- `true_ndh_norm` = `true_ndh` / (peak true return − initial true return)
+
+Values near 0 mean true return is still at its training peak. Negative values mean the policy has fallen below the best true performance seen while optimising the proxy.
 
 ## How to run
 

@@ -183,6 +183,27 @@ def hidden_dim_for_grid(grid_size: int) -> int:
     return 128
 
 
+def normalised_drop_height(
+    true_return: float,
+    peak_true: float,
+    initial_true: float,
+) -> Tuple[float, float]:
+    """
+    Normalised drop height on true reward R_0 (Skalse et al. 2023, arXiv:2310.09144).
+
+    Definition 5: NDH = J_R0(π_1) - max_{λ∈[0,1]} J_R0(π_λ), i.e. loss of true
+    reward along the optimisation path. Here outer_iter proxies λ and true_return
+    is J_R0(π). peak_true is the running max of J_R0 over training.
+
+    ndh_norm divides by peak gain J_R0(π*) - J_R0(π_0) for scale-free comparison.
+    ndh <= 0; more negative means larger drop from best true return so far.
+    """
+    ndh = true_return - peak_true
+    gain = peak_true - initial_true
+    ndh_norm = ndh / gain if abs(gain) > 1e-8 else 0.0
+    return ndh, ndh_norm
+
+
 # ---------------------------------------------------------------------------
 # Evaluation helpers
 # ---------------------------------------------------------------------------
@@ -347,6 +368,8 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
     )
 
     logs: List[Dict] = []
+    initial_true: Optional[float] = None
+    peak_true = float("-inf")
 
     for outer_iter in range(cfg.num_outer_iters):
         recent_trajs = collect_policy_trajectories(env, policy, n=24)
@@ -389,6 +412,11 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         true_ret = policy_rollout_true_return(env, policy, cfg.eval_episodes)
         learned_ret = policy_rollout_learned_return(policy, reward_model, env, cfg.eval_episodes)
 
+        if initial_true is None:
+            initial_true = true_ret
+        peak_true = max(peak_true, true_ret)
+        true_ndh, true_ndh_norm = normalised_drop_height(true_ret, peak_true, initial_true)
+
         logs.append(
             {
                 "method": cfg.method,
@@ -397,6 +425,8 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
                 "outer_iter": outer_iter,
                 "true_eval_return": true_ret,
                 "learned_eval_return": learned_ret,
+                "true_ndh": true_ndh,
+                "true_ndh_norm": true_ndh_norm,
                 "reward_model_drift": last_drift,
                 "reward_model_pref_accuracy": pref_acc,
                 "clip_epsilon": clip_eps,
@@ -495,13 +525,20 @@ def print_summary(all_logs: List[Dict]) -> None:
                 final_by_seed[r["seed"]] = r["true_eval_return"]
         finals = list(final_by_seed.values())
         kls = [np.mean(v) for v in kl_by_seed.values()]
+        ndh_norm_by_seed: Dict[int, float] = {}
+        for r in rows:
+            if r["outer_iter"] == max(x["outer_iter"] for x in rows if x["seed"] == r["seed"]):
+                ndh_norm_by_seed[r["seed"]] = float(r["true_ndh_norm"])
+        ndh_norms = list(ndh_norm_by_seed.values())
         print(f"\n{METHOD_LABELS[method]}:")
         print(f"  Final true return: {np.mean(finals):.3f} ± {np.std(finals):.3f}")
         print(f"  Mean policy KL:    {np.mean(kls):.4f} ± {np.std(kls):.4f}")
+        print(f"  Final true NDH (norm): {np.mean(ndh_norms):.3f} ± {np.std(ndh_norms):.3f}")
     print("\nInterpretation:")
     print("  - Higher final true return = better alignment with real goal/trap rewards.")
     print("  - Large policy KL spikes after RM updates suggest PPO instability.")
     print("  - Adaptive clip tightens ε from RM drift, then further when critic mismatch is high.")
+    print("  - True NDH (norm): J_R0(π) − max J_R0 vs peak gain (Skalse et al. 2023); ≤ 0.")
     print("=" * 60 + "\n")
 
 
@@ -547,6 +584,7 @@ def main() -> None:
     plots = [
         ("true_eval_return", "True eval return", "True environment return vs training"),
         ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
+        ("true_ndh_norm", "True NDH (normalised)", "Normalised drop height on true reward R₀"),
         ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
         ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training"),
         ("clip_eps_base", "Drift-only clip ε", "Drift-based clip epsilon before critic tightening"),
