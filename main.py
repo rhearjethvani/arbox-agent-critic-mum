@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-from gridworld import GridWorld, Trajectory
+from gridworld import GridWorld, Trajectory, default_max_steps
 from networks import ActorCritic, RewardModel
 from ppo import PPOTrainer
 
@@ -134,13 +134,29 @@ def preference_accuracy(
     return correct / len(pairs)
 
 
+def normalize_drift_for_grid(drift: float, grid_size: int) -> float:
+    """Per-step drift: trajectory-return drift scales with episode length (6×N)."""
+    return drift / default_max_steps(grid_size)
+
+
+def drift_thresholds_for_grid(
+    grid_size: int, ref_grid: int = 5, base_low: float = 0.05, base_mid: float = 0.15
+) -> Tuple[float, float]:
+    """Reference thresholds at ref_grid; scale linearly with N for raw drift plots."""
+    scale = grid_size / ref_grid
+    return base_low * scale, base_mid * scale
+
+
 def clip_eps_from_drift(
     drift: float,
     eps_max: float = 0.25,
     eps_min: float = 0.05,
     drift_low: float = 0.05,
     drift_mid: float = 0.15,
+    grid_size: Optional[int] = None,
 ) -> float:
+    if grid_size is not None:
+        drift = normalize_drift_for_grid(drift, grid_size)
     eps_mid = (eps_max + eps_min) / 2.0
     if drift < drift_low:
         return eps_max
@@ -157,10 +173,16 @@ def clip_eps_from_drift_and_critic(
     drift_low: float = 0.05,
     drift_mid: float = 0.15,
     critic_error_ref: float = 10.0,
+    grid_size: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Drift sets base ε; critic mismatch tightens toward eps_min."""
     base_eps = clip_eps_from_drift(
-        drift, eps_max=eps_max, eps_min=eps_min, drift_low=drift_low, drift_mid=drift_mid
+        drift,
+        eps_max=eps_max,
+        eps_min=eps_min,
+        drift_low=drift_low,
+        drift_mid=drift_mid,
+        grid_size=grid_size,
     )
     stress = min(critic_error / critic_error_ref, 1.0)
     final_eps = base_eps - stress * (base_eps - eps_min)
@@ -396,14 +418,17 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         clip_eps_base = clip_eps
         for ppo_i in range(cfg.ppo_updates_per_outer):
             batch, _ = ppo.collect_rollout()
-            if rm_updated and cfg.method == "adaptive_clip" and ppo_i == 0:
+            use_critic_clip = cfg.method in ("fixed_rm_critic_clip", "adaptive_clip")
+            if use_critic_clip and ppo_i == 0:
                 critic_error = float(np.mean(np.abs(batch.returns - batch.values)))
+                drift = last_drift if cfg.method == "adaptive_clip" else 0.0
                 clip_eps, clip_eps_base = clip_eps_from_drift_and_critic(
-                    last_drift,
+                    drift,
                     critic_error,
                     eps_max=cfg.eps_max,
                     eps_min=cfg.eps_min,
                     critic_error_ref=cfg.critic_error_ref,
+                    grid_size=cfg.grid_size,
                 )
                 ppo.set_clip_eps(clip_eps)
             metrics = ppo.update(batch)
@@ -446,11 +471,12 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 
-METHODS = ["fixed_rm", "vanilla_updated_rm", "adaptive_clip"]
+METHODS = ["fixed_rm", "vanilla_updated_rm", "fixed_rm_critic_clip", "adaptive_clip"]
 METHOD_LABELS = {
-    "fixed_rm": "Fixed RM",
-    "vanilla_updated_rm": "Vanilla updated RM",
-    "adaptive_clip": "Critic-informed adaptive clip",
+    "fixed_rm": "Fixed RM, fixed ε",
+    "vanilla_updated_rm": "Updated RM, fixed ε",
+    "fixed_rm_critic_clip": "Fixed RM, critic ε",
+    "adaptive_clip": "Updated RM, critic ε",
 }
 
 
@@ -537,7 +563,8 @@ def print_summary(all_logs: List[Dict]) -> None:
     print("\nInterpretation:")
     print("  - Higher final true return = better alignment with real goal/trap rewards.")
     print("  - Large policy KL spikes after RM updates suggest PPO instability.")
-    print("  - Adaptive clip tightens ε from RM drift, then further when critic mismatch is high.")
+    print("  - Critic-informed methods recompute ε every outer iter from critic mismatch.")
+    print("  - adaptive_clip also uses last RM drift for base ε (updated when RM retrains).")
     print("  - True NDH (norm): J_R0(π) − max J_R0 vs peak gain (Skalse et al. 2023); ≤ 0.")
     print("=" * 60 + "\n")
 
@@ -584,11 +611,9 @@ def main() -> None:
     plots = [
         ("true_eval_return", "True eval return", "True environment return vs training"),
         ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
-        ("true_ndh_norm", "True NDH (normalised)", "Normalised drop height on true reward R₀"),
         ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
-        ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training"),
-        ("clip_eps_base", "Drift-only clip ε", "Drift-based clip epsilon before critic tightening"),
-        ("critic_error", "Critic error", "Mean |returns − values| after RM updates"),
+        ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training (drift ÷ 6×N)"),
+        ("critic_error", "Critic error", "Mean |returns − values| when ε is set"),
         ("approx_policy_kl", "Approx policy KL", "Approximate policy KL vs training"),
     ]
     for metric, ylabel, title in plots:
