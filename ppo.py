@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from gridworld import GridWorld, MAX_STEPS, Trajectory
+from gridworld import GridWorld, Trajectory
 from networks import ActorCritic, RewardModel
 
 
