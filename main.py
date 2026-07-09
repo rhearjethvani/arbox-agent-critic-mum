@@ -262,6 +262,46 @@ def normalised_drop_height(
     return ndh, ndh_norm
 
 
+def area_under_true_reward_curve(true_history: List[float]) -> Tuple[float, float]:
+    """
+    Area under the true-reward curve (AUTC).
+
+    AUTC = ∫_0^1 J_R_true(π_λ) dλ, where outer_iter proxies optimisation pressure λ.
+    Rewards methods that maintain high true reward over the whole path, not just at one point.
+
+    autc_norm integrates returns normalized by peak gain (J* − J_0) for scale-free comparison.
+    """
+    n = len(true_history)
+    if n < 2:
+        return 0.0, 0.0
+    lambdas = np.linspace(0.0, 1.0, n)
+    autc = float(np.trapz(true_history, lambdas))
+    initial = true_history[0]
+    peak = max(true_history)
+    gain = peak - initial
+    if abs(gain) < 1e-8:
+        return autc, 0.0
+    g = [(val - initial) / gain for val in true_history]
+    autc_norm = float(np.trapz(g, lambdas))
+    return autc, autc_norm
+
+
+def add_true_autc_to_logs(all_logs: List[Dict]) -> None:
+    """Populate true_autc / true_autc_norm from true_eval_return (in-place)."""
+    groups: Dict[Tuple[str, int], List[Dict]] = {}
+    for row in all_logs:
+        key = (row["method"], row["seed"])
+        groups.setdefault(key, []).append(row)
+    for rows in groups.values():
+        rows.sort(key=lambda r: r["outer_iter"])
+        history: List[float] = []
+        for row in rows:
+            history.append(float(row["true_eval_return"]))
+            autc, autc_norm = area_under_true_reward_curve(history)
+            row["true_autc"] = autc
+            row["true_autc_norm"] = autc_norm
+
+
 # ---------------------------------------------------------------------------
 # Evaluation helpers
 # ---------------------------------------------------------------------------
@@ -451,6 +491,7 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
     logs: List[Dict] = []
     initial_true: Optional[float] = None
     peak_true = float("-inf")
+    true_history: List[float] = []
 
     for outer_iter in range(cfg.num_outer_iters):
         recent_trajs = collect_policy_trajectories(env, policy, n=24)
@@ -501,6 +542,9 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
         peak_true = max(peak_true, true_ret)
         true_ndh, true_ndh_norm = normalised_drop_height(true_ret, peak_true, initial_true)
 
+        true_history.append(true_ret)
+        true_autc, true_autc_norm = area_under_true_reward_curve(true_history)
+
         logs.append(
             {
                 "method": cfg.method,
@@ -515,6 +559,8 @@ def run_experiment(cfg: RunConfig) -> List[Dict]:
                 "learned_eval_return": learned_ret,
                 "true_ndh": true_ndh,
                 "true_ndh_norm": true_ndh_norm,
+                "true_autc": true_autc,
+                "true_autc_norm": true_autc_norm,
                 "reward_model_drift": last_drift,
                 "reward_model_pref_accuracy": pref_acc,
                 "clip_epsilon": clip_eps,
@@ -618,20 +664,25 @@ def print_summary(all_logs: List[Dict], rm_variant: Optional[str] = None) -> Non
         finals = list(final_by_seed.values())
         kls = [np.mean(v) for v in kl_by_seed.values()]
         ndh_norm_by_seed: Dict[int, float] = {}
+        autc_norm_by_seed: Dict[int, float] = {}
         for r in rows:
             if r["outer_iter"] == max(x["outer_iter"] for x in rows if x["seed"] == r["seed"]):
                 ndh_norm_by_seed[r["seed"]] = float(r["true_ndh_norm"])
+                autc_norm_by_seed[r["seed"]] = float(r["true_autc_norm"])
         ndh_norms = list(ndh_norm_by_seed.values())
+        autc_norms = list(autc_norm_by_seed.values())
         print(f"\n{METHOD_LABELS[method]}:")
         print(f"  Final true return: {np.mean(finals):.3f} ± {np.std(finals):.3f}")
         print(f"  Mean policy KL:    {np.mean(kls):.4f} ± {np.std(kls):.4f}")
         print(f"  Final true NDH (norm): {np.mean(ndh_norms):.3f} ± {np.std(ndh_norms):.3f}")
+        print(f"  Final true AUTC (norm): {np.mean(autc_norms):.3f} ± {np.std(autc_norms):.3f}")
     print("\nInterpretation:")
     print("  - Higher final true return = better alignment with real goal/trap rewards.")
     print("  - Large policy KL spikes after RM updates suggest PPO instability.")
     print("  - Critic-informed methods recompute ε every outer iter from critic mismatch.")
     print("  - adaptive_clip also uses last RM drift for base ε (updated when RM retrains).")
     print("  - True NDH (norm): J_R0(π) − max J_R0 vs peak gain (Skalse et al. 2023); ≤ 0.")
+    print("  - True AUTC (norm): ∫ J_R0 along training path; higher = sustained true reward.")
     print("=" * 60 + "\n")
 
 
@@ -660,6 +711,7 @@ def run_variant_experiments(
             all_logs.extend(logs)
 
     csv_path = os.path.join(variant_dir, "experiment_logs.csv")
+    add_true_autc_to_logs(all_logs)
     save_logs_csv(all_logs, csv_path)
     print(f"Saved logs to {csv_path}")
 
@@ -667,6 +719,11 @@ def run_variant_experiments(
         ("true_eval_return", "True eval return", "True environment return vs training"),
         ("learned_eval_return", "Learned eval return", "Reward model return vs training"),
         ("true_ndh_norm", "True NDH (normalised)", "Normalised drop height on true reward R₀"),
+        (
+            "true_autc_norm",
+            "True AUTC (normalised)",
+            "Area under the true-reward curve (overoptimization)",
+        ),
         ("reward_model_drift", "RM drift", "Reward model drift on validation trajectories"),
         ("clip_epsilon", "PPO clip ε", "PPO clip epsilon vs training (drift ÷ 6×N)"),
         ("critic_error", "Critic error", "Mean |returns − values| when ε is set"),

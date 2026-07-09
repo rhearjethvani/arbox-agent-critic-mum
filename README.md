@@ -136,12 +136,13 @@ Saved under `results/full_rm/` and `results/broken_rm/` (when `--rm_mode both`):
 | `true_eval_return.png` | Policy quality under the **true** reward (main success metric) |
 | `learned_eval_return.png` | Return under the **current** reward model (what PPO optimizes) |
 | `true_ndh_norm.png` | Goodharting on true reward R₀ ([Skalse et al. 2023](https://arxiv.org/abs/2310.09144)) |
+| `true_autc_norm.png` | Area under the true-reward curve — rewards sustained true performance over training |
 | `reward_model_drift.png` | How much RM outputs shift on validation trajectories after updates |
 | `clip_epsilon.png` | Final PPO clip ε vs training (drift normalized by 6×N before thresholding) |
 | `critic_error.png` | Critic mismatch each time ε is recomputed (critic-informed methods) |
 | `approx_policy_kl.png` | Proxy for policy change magnitude—spikes may indicate instability |
 
-Raw logs: `results/{full_rm,broken_rm}/experiment_logs.csv` (includes `rm_variant`, `rm_input_mode`, `rm_hidden`, `rm_layers`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`)
+Raw logs: `results/{full_rm,broken_rm}/experiment_logs.csv` (includes `rm_variant`, `rm_input_mode`, `rm_hidden`, `rm_layers`, `critic_error`, `clip_eps_base`, `true_ndh`, `true_ndh_norm`, `true_autc`, `true_autc_norm`)
 
 ### True-reward over-optimization metric (NDH)
 
@@ -157,6 +158,20 @@ In this experiment R₀ is the **true gridworld reward** (`true_eval_return`); P
 - `true_ndh_norm` = `true_ndh` / (peak true return − initial true return)
 
 Values near 0 mean true return is still at its training peak. Negative values mean the policy has fallen below the best true performance seen while optimising the proxy.
+
+### Area under the true-reward curve (AUTC)
+
+Measures performance across the whole optimisation path, not just at one point:
+
+```
+AUTC = ∫₀¹ J_R_true(π_λ) dλ
+```
+
+Outer iteration proxies λ ∈ [0, 1]. Each log step records the running integral of `true_eval_return` up to that iteration.
+
+- `true_autc` = raw integral of true returns along training
+- `true_autc_norm` = integral of returns normalized by peak gain `(J − J_0) / (J* − J_0)`
+- **Higher** AUTC = method maintains high true reward over the whole path (less overoptimization)
 
 ## How to run
 
